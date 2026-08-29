@@ -1,0 +1,186 @@
+name: Oracle A1 Auto Provision
+
+on:
+  schedule:
+    # A cada 30 minutos, evitando o minuto 0
+    - cron: "7,37 * * * *"
+
+  # Permite executar manualmente para testar
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-a1-maqcontrolgb
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_CLI_REGION: sa-saopaulo-1
+
+      OCI_STACK_OCID: ${{ secrets.OCI_STACK_OCID }}
+      OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+
+      INSTANCE_NAME: maqcontrolgb-prod
+
+    steps:
+      - name: Instalar OCI CLI
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/oci-venv"
+          "$RUNNER_TEMP/oci-venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/oci-venv/bin/pip" install oci-cli
+          echo "$RUNNER_TEMP/oci-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Testar autenticação Oracle
+        shell: bash
+        run: |
+          oci iam region list --limit 1 > /dev/null
+          echo "Autenticação OCI funcionando."
+
+      - name: Procurar VPS
+        id: instance
+        shell: bash
+        run: |
+          INSTANCE_ID="$(
+            oci compute instance list \
+              --compartment-id "$OCI_COMPARTMENT_OCID" \
+              --display-name "$INSTANCE_NAME" \
+              --all |
+            jq -r '
+              .data[]
+              | select(
+                  .["lifecycle-state"] != "TERMINATED"
+                  and .["lifecycle-state"] != "TERMINATING"
+                )
+              | .id
+            ' | head -n 1
+          )"
+
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "VPS ainda não existe."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "VPS encontrada: $INSTANCE_ID"
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Tentar criar VPS 1 OCPU / 6 GB
+        if: steps.instance.outputs.exists == 'false'
+        shell: bash
+        run: |
+          echo "Tentando executar Apply da Stack..."
+
+          JOB_ID="$(
+            oci resource-manager job create-apply-job \
+              --stack-id "$OCI_STACK_OCID" \
+              --execution-plan-strategy AUTO_APPROVED \
+              --display-name "auto-a1-$(date -u +%Y%m%d-%H%M%S)" \
+              --query 'data.id' \
+              --raw-output
+          )"
+
+          echo "Job criado: $JOB_ID"
+
+          for i in $(seq 1 60); do
+            STATE="$(
+              oci resource-manager job get \
+                --job-id "$JOB_ID" \
+                --query 'data."lifecycle-state"' \
+                --raw-output
+            )"
+
+            echo "Estado do Apply: $STATE"
+
+            if [ "$STATE" = "SUCCEEDED" ]; then
+              echo "VPS criada com sucesso!"
+              exit 0
+            fi
+
+            if [ "$STATE" = "FAILED" ] || \
+               [ "$STATE" = "CANCELED" ] || \
+               [ "$STATE" = "CANCELING" ]; then
+              echo "Ainda não foi possível criar a VPS."
+              echo "Provavelmente não há capacidade A1 disponível."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Apply ainda não terminou. Será verificado novamente depois."
+
+      - name: Verificar configuração da VPS
+        if: steps.instance.outputs.exists == 'true'
+        id: shape
+        shell: bash
+        env:
+          INSTANCE_ID: ${{ steps.instance.outputs.instance_id }}
+        run: |
+          INSTANCE_JSON="$(
+            oci compute instance get \
+              --instance-id "$INSTANCE_ID"
+          )"
+
+          STATE="$(
+            echo "$INSTANCE_JSON" |
+            jq -r '.data["lifecycle-state"]'
+          )"
+
+          OCPUS="$(
+            echo "$INSTANCE_JSON" |
+            jq -r '.data["shape-config"].ocpus'
+          )"
+
+          MEMORY="$(
+            echo "$INSTANCE_JSON" |
+            jq -r '.data["shape-config"]["memory-in-gbs"]'
+          )"
+
+          echo "Estado: $STATE"
+          echo "OCPUs: $OCPUS"
+          echo "Memória: $MEMORY GB"
+
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "ocpus=$OCPUS" >> "$GITHUB_OUTPUT"
+          echo "memory=$MEMORY" >> "$GITHUB_OUTPUT"
+
+      - name: Tentar aumentar para 2 OCPU / 12 GB
+        if: >
+          steps.instance.outputs.exists == 'true' &&
+          steps.shape.outputs.state == 'RUNNING' &&
+          (steps.shape.outputs.ocpus != '2' ||
+           steps.shape.outputs.memory != '12')
+        shell: bash
+        env:
+          INSTANCE_ID: ${{ steps.instance.outputs.instance_id }}
+        run: |
+          echo "VPS existe, mas ainda não está em 2 OCPU / 12 GB."
+          echo "Tentando upgrade..."
+
+          set +e
+
+          oci compute instance update \
+            --instance-id "$INSTANCE_ID" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+            --force
+
+          RESULT=$?
+
+          set -e
+
+          if [ "$RESULT" -eq 0 ]; then
+            echo "Upgrade para 2 OCPU / 12 GB solicitado com sucesso."
+          else
+            echo "Ainda não há capacidade para 2 OCPU / 12 GB."
+            echo "A automação tentará novamente na próxima execução."
+          fi
