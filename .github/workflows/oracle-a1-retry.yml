@@ -8,6 +8,11 @@ on:
   # Permite executar manualmente para testar
   workflow_dispatch:
 
+# Permite ao workflow criar uma Issue de notificação
+permissions:
+  contents: read
+  issues: write
+
 concurrency:
   group: oracle-a1-maqcontrolgb
   cancel-in-progress: false
@@ -74,9 +79,12 @@ jobs:
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Tentar criar VPS 1 OCPU / 6 GB
+        id: create
         if: steps.instance.outputs.exists == 'false'
         shell: bash
         run: |
+          echo "created=false" >> "$GITHUB_OUTPUT"
+
           echo "Tentando executar Apply da Stack..."
 
           JOB_ID="$(
@@ -102,6 +110,7 @@ jobs:
 
             if [ "$STATE" = "SUCCEEDED" ]; then
               echo "VPS criada com sucesso!"
+              echo "created=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
@@ -117,6 +126,46 @@ jobs:
           done
 
           echo "Apply ainda não terminou. Será verificado novamente depois."
+
+      # ------------------------------------------------------------
+      # Notificação somente quando a VPS for criada com sucesso
+      # ------------------------------------------------------------
+
+      - name: Notificar criação da VPS
+        if: steps.create.outputs.created == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "VPS Oracle criada - maqcontrolgb-prod" \
+            --assignee "$GITHUB_REPOSITORY_OWNER" \
+            --body "$(cat <<'EOF'
+          ## VPS criada com sucesso
+
+          A automação conseguiu provisionar a VPS:
+
+          **maqcontrolgb-prod**
+
+          Configuração inicial:
+
+          - VM.Standard.A1.Flex
+          - 1 OCPU
+          - 6 GB RAM
+          - Região: São Paulo
+
+          A automação continuará executando e tentará aumentar a instância para:
+
+          **2 OCPU / 12 GB RAM**
+
+          Agora você já pode acessar:
+
+          **Oracle Cloud → Compute → Instances → maqcontrolgb-prod**
+          EOF
+          )"
+
+          echo "Notificação criada no GitHub."
 
       - name: Verificar configuração da VPS
         if: steps.instance.outputs.exists == 'true'
